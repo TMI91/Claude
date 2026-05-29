@@ -1,6 +1,16 @@
 # Claude
 
-## Network Vulnerability Scanner
+A collection of security and utility tools.
+
+## Subprojects
+
+| Project | Beschrijving |
+|---------|-------------|
+| [vuln_scanner](vuln_scanner/) | Netwerk vulnerability scanner via nmap |
+
+---
+
+## vuln_scanner
 
 Scant je lokale netwerk op live hosts, open poorten, service-versies en bekende kwetsbaarheden via nmap NSE-scripts.
 
@@ -18,6 +28,7 @@ Of download van https://nmap.org/download.html en installeer met de standaardins
 **2. Installeer Python-packages**
 
 ```
+cd vuln_scanner
 pip install -r requirements.txt
 ```
 
@@ -26,8 +37,10 @@ pip install -r requirements.txt
 ### Gebruik
 
 ```
+cd vuln_scanner
+
 # Automatisch je /24-subnet detecteren en scannen (normaal modus)
-python vuln_scanner.py
+python vuln_scanner.py --mode normal
 
 # Specifiek subnet of host
 python vuln_scanner.py --target 192.168.1.0/24
@@ -39,7 +52,7 @@ python vuln_scanner.py --mode fast
 # Grondige scan (alle poorten + alle vuln-scripts — kan lang duren)
 python vuln_scanner.py --mode thorough
 
-# Resultaten opslaan als JSON
+# Resultaten opslaan als JSON én Markdown
 python vuln_scanner.py --output rapport.json
 ```
 

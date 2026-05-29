@@ -1,4 +1,5 @@
 *.json
+rapport*.md
 *.md.bak
 __pycache__/
 *.pyc
