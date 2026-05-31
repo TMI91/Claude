@@ -557,7 +557,7 @@ def detect_anomalies(flow_table: FlowTable) -> list:
 # ---------------------------------------------------------------------------
 
 def build_live_table(flow_table: FlowTable, anomalies: list,
-                     dns: "DNSCache") -> "Table":
+                     dns: "DNSCache", iface_display: str = "") -> "Table":
     snap = flow_table.snapshot()
     elapsed = int(time.time() - flow_table.start_time)
 
@@ -577,7 +577,7 @@ def build_live_table(flow_table: FlowTable, anomalies: list,
     warn = f"\n[yellow]{flow_table.sniffer_warning}[/yellow]" if flow_table.sniffer_warning else ""
     table = Table(
         title=f"[bold cyan]Network Traffic Monitor[/bold cyan]  "
-              f"[dim]{elapsed}s elapsed — {flow_table.total_packets:,} packets[/dim]{warn}",
+              f"[dim]{iface_display} | {elapsed}s elapsed — {flow_table.total_packets:,} packets[/dim]{warn}",
         box=box.SIMPLE_HEAVY,
         show_header=True,
         header_style="bold",
@@ -627,13 +627,14 @@ def build_live_table(flow_table: FlowTable, anomalies: list,
 
 
 def run_live_display(flow_table: FlowTable, stop_event: threading.Event,
-                     duration: int | None, dns: "DNSCache") -> None:
+                     duration: int | None, dns: "DNSCache",
+                     iface_display: str = "") -> None:
     deadline = time.time() + duration if duration else None
 
     with Live(console=console, refresh_per_second=0.5, screen=False) as live:
         while not stop_event.is_set():
             anomalies = detect_anomalies(flow_table)
-            live.update(build_live_table(flow_table, anomalies, dns))
+            live.update(build_live_table(flow_table, anomalies, dns, iface_display))
             time.sleep(LIVE_REFRESH_INTERVAL)
             if deadline and time.time() >= deadline:
                 stop_event.set()
@@ -936,7 +937,7 @@ def print_usage() -> None:
     _print("[bold]USAGE[/bold]")
     _print("  python traffic_monitor.py [OPTIONS]\n")
     _print("[bold]OPTIONS[/bold]")
-    _print("  --interface NIC   NIC name to capture on  [default: auto-detect]")
+    _print("  --interface NIC [NIC ...]  NIC(s) to capture on; omit to get a selection prompt")
     _print("  --duration  SEC   Capture for N seconds   [default: until Ctrl+C]")
     _print("  --output    FILE  Save JSON + Markdown report  e.g. capture.json")
     _print("  --mode      MODE  live (default) | quiet")
@@ -949,12 +950,84 @@ def print_usage() -> None:
     _print("  python traffic_monitor.py --mode live\n")
     _print("  # Capture 60s on Wi-Fi, save report")
     _print("  python traffic_monitor.py --duration 60 --interface Wi-Fi --output capture.json\n")
+    _print("  # Capture on two interfaces simultaneously")
+    _print("  python traffic_monitor.py --interface Wi-Fi Ethernet --mode live\n")
     _print("  # Quiet capture, filter to one host")
     _print("  python traffic_monitor.py --filter \"host 192.168.1.50\" --mode quiet\n")
     _print("[bold]REQUIREMENTS[/bold]")
     _print("  - Npcap installed  (bundled with nmap: winget install nmap)")
     _print("  - pip install -r requirements.txt  (scapy, rich)")
     _print("  - Run as Administrator (raw socket capture requires elevated privileges)")
+
+
+# ---------------------------------------------------------------------------
+# Interface listing and interactive selection
+# ---------------------------------------------------------------------------
+
+def list_interfaces() -> list:
+    """Return list of (name, ip, description) for active network adapters."""
+    results = []
+    # Try PowerShell Get-NetAdapter (most reliable on Windows)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["powershell", "-Command",
+             "Get-NetAdapter | Where-Object {$_.Status -eq 'Up'} | "
+             "ForEach-Object { $ip = (Get-NetIPAddress -InterfaceIndex $_.ifIndex "
+             "-AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+             "Select-Object -First 1 -ExpandProperty IPAddress); "
+             "Write-Output \"$($_.Name)|$ip|$($_.InterfaceDescription)\" }"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        for line in out.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) == 3:
+                name, ip, desc = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                results.append((name, ip, desc))
+    except Exception:
+        pass
+    return results
+
+
+def select_interfaces(default: str) -> list:
+    """Show available interfaces and let the user choose one or more.
+    Returns a list of interface name strings."""
+    ifaces = list_interfaces()
+
+    if not ifaces:
+        # Can't enumerate — fall back to default without prompting
+        return [default]
+
+    _print("\n[bold]Available network interfaces:[/bold]")
+    default_idx = None
+    for i, (name, ip, desc) in enumerate(ifaces, 1):
+        marker = ""
+        if name == default:
+            marker = "  [green]<- default[/green]"
+            default_idx = i
+        _print(f"  [cyan]{i}[/cyan]  {name:15} {ip or '':16} {desc}{marker}")
+    _print("")
+    _print("Enter number(s) to capture on (e.g. [bold]1[/bold] or [bold]1 2[/bold]),"
+           f" or press Enter for default [{default}]: ", style="")
+
+    try:
+        raw = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+
+    if not raw:
+        return [default]
+
+    selected = []
+    for token in raw.split():
+        try:
+            idx = int(token) - 1
+            if 0 <= idx < len(ifaces):
+                selected.append(ifaces[idx][0])
+        except ValueError:
+            pass
+
+    return selected if selected else [default]
 
 
 # ---------------------------------------------------------------------------
@@ -967,8 +1040,8 @@ def main() -> None:
         sys.exit(0)
 
     parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--interface", default=None,
-                        help="NIC display name (e.g. Wi-Fi, Ethernet)")
+    parser.add_argument("--interface", nargs="+", default=None, metavar="NIC",
+                        help="NIC name(s) to capture on; repeat or space-separate for multiple")
     parser.add_argument("--duration", type=int, default=None,
                         help="Capture duration in seconds (default: until Ctrl+C)")
     parser.add_argument("--output", default=None,
@@ -989,15 +1062,24 @@ def main() -> None:
         _print("and run this script as Administrator.")
         sys.exit(1)
 
-    host_ip    = get_host_ip()
-    iface      = args.interface or get_default_interface()
+    host_ip = get_host_ip()
+
+    # Interface selection
+    if args.interface:
+        interfaces = args.interface
+    else:
+        interfaces = select_interfaces(get_default_interface())
+
+    iface_display = ", ".join(interfaces)
+    iface_for_sniff = interfaces if len(interfaces) > 1 else interfaces[0]
+
     ip_filter  = _extract_ip_from_filter(args.bpf_filter)
     flow_table = FlowTable(host_ip=host_ip, ip_filter=ip_filter)
 
     capture_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     _print(f"[bold cyan]Network Traffic Monitor[/bold cyan]")
-    _print(f"  Interface : [cyan]{iface}[/cyan]")
+    _print(f"  Interface{'s' if len(interfaces) > 1 else ''} : [cyan]{iface_display}[/cyan]")
     _print(f"  Host IP   : [cyan]{host_ip}[/cyan]")
     _print(f"  Duration  : {'{}s'.format(args.duration) if args.duration else 'until Ctrl+C'}")
     if args.bpf_filter:
@@ -1006,11 +1088,11 @@ def main() -> None:
 
     dns = DNSCache()
     stop_event = threading.Event()
-    sniffer_thread = start_sniffer(iface, flow_table, stop_event, args.bpf_filter)
+    sniffer_thread = start_sniffer(iface_for_sniff, flow_table, stop_event, args.bpf_filter)
 
     try:
         if args.mode == "live" and RICH:
-            run_live_display(flow_table, stop_event, args.duration, dns)
+            run_live_display(flow_table, stop_event, args.duration, dns, iface_display)
         else:
             dur_str = f"{args.duration}s" if args.duration else "until Ctrl+C"
             _print(f"[dim]Capturing {dur_str}... press Ctrl+C to stop.[/dim]")
@@ -1035,7 +1117,7 @@ def main() -> None:
     if args.output:
         meta = {
             "capture_time":     capture_time,
-            "interface":        iface,
+            "interface":        iface_display,
             "host_ip":          host_ip,
             "duration_seconds": args.duration,
             "total_packets":    flow_table.total_packets,
