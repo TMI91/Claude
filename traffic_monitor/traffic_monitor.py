@@ -989,26 +989,22 @@ def list_interfaces() -> list:
     return results
 
 
-def select_interfaces(default: str) -> list:
-    """Show available interfaces and let the user choose one or more.
-    Returns a list of interface name strings."""
-    ifaces = list_interfaces()
+def choose_interfaces(all_ifaces: list, default: list) -> list:
+    """Show a numbered interface list and let the user pick one or more.
+    Returns the chosen list; falls back to default on Enter or invalid input."""
+    if not all_ifaces:
+        return default
 
-    if not ifaces:
-        # Can't enumerate — fall back to default without prompting
-        return [default]
+    default_names = set(default)
+    _print("[bold]Available interfaces:[/bold]")
+    for i, (name, ip, desc) in enumerate(all_ifaces, 1):
+        marker = "  [green]*[/green]" if name in default_names else ""
+        ip_str = f"[dim]{ip or '':>16}[/dim]"
+        _print(f"  [cyan]{i}[/cyan]  {name:<16} {ip_str}  {desc}{marker}")
 
-    _print("\n[bold]Available network interfaces:[/bold]")
-    default_idx = None
-    for i, (name, ip, desc) in enumerate(ifaces, 1):
-        marker = ""
-        if name == default:
-            marker = "  [green]<- default[/green]"
-            default_idx = i
-        _print(f"  [cyan]{i}[/cyan]  {name:15} {ip or '':16} {desc}{marker}")
-    _print("")
-    _print("Enter number(s) to capture on (e.g. [bold]1[/bold] or [bold]1 2[/bold]),"
-           f" or press Enter for default [{default}]: ", style="")
+    default_str = ", ".join(default)
+    _print(f"\n  Type number(s) to capture on (e.g. [bold]1[/bold] or [bold]1 2[/bold]),"
+           f" or press Enter for default [[cyan]{default_str}[/cyan]]: ", style="")
 
     try:
         raw = input().strip()
@@ -1016,18 +1012,47 @@ def select_interfaces(default: str) -> list:
         raw = ""
 
     if not raw:
-        return [default]
+        return default
 
     selected = []
     for token in raw.split():
         try:
             idx = int(token) - 1
-            if 0 <= idx < len(ifaces):
-                selected.append(ifaces[idx][0])
+            if 0 <= idx < len(all_ifaces):
+                name = all_ifaces[idx][0]
+                if name not in selected:
+                    selected.append(name)
         except ValueError:
             pass
+    return selected or default
 
-    return selected if selected else [default]
+
+def print_config(interfaces: list, all_ifaces: list, duration: int,
+                 mode: str, bpf_filter: str) -> None:
+    """Print the active configuration with alternatives shown in brackets."""
+    _print("[bold cyan]Network Traffic Monitor[/bold cyan]")
+
+    # Interface
+    current = ", ".join(interfaces)
+    others  = [n for n, _, _ in all_ifaces if n not in interfaces]
+    alt     = f"  [dim](other: {', '.join(others)})[/dim]" if others else ""
+    label   = "Interfaces" if len(interfaces) > 1 else "Interface "
+    _print(f"  {label}: [cyan]{current}[/cyan]{alt}")
+
+    # Duration
+    dur_str   = f"{duration}s" if duration else "until Ctrl+C"
+    other_dur = "until Ctrl+C" if duration else "30s"
+    _print(f"  Duration  : [cyan]{dur_str}[/cyan]  [dim](other: {other_dur})[/dim]")
+
+    # Mode
+    other_mode = "quiet" if mode == "live" else "live"
+    _print(f"  Mode      : [cyan]{mode}[/cyan]  [dim](other: {other_mode})[/dim]")
+
+    # Filter
+    if bpf_filter:
+        _print(f"  Filter    : [cyan]{bpf_filter}[/cyan]")
+
+    _print("")
 
 
 # ---------------------------------------------------------------------------
@@ -1035,19 +1060,15 @@ def select_interfaces(default: str) -> list:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) == 1:
-        print_usage()
-        sys.exit(0)
-
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--interface", nargs="+", default=None, metavar="NIC",
-                        help="NIC name(s) to capture on; repeat or space-separate for multiple")
-    parser.add_argument("--duration", type=int, default=None,
-                        help="Capture duration in seconds (default: until Ctrl+C)")
+                        help="NIC(s) to capture on (default: Wi-Fi or auto-detected)")
+    parser.add_argument("--duration", type=int, default=30,
+                        help="Capture duration in seconds (default: 30)")
     parser.add_argument("--output", default=None,
                         help="Save JSON + Markdown report to this path")
     parser.add_argument("--mode", choices=["live", "quiet"], default="live",
-                        help="Display mode (default: live)")
+                        help="Display mode: live (default) or quiet")
     parser.add_argument("--filter", default="", dest="bpf_filter",
                         help="BPF filter expression (e.g. 'host 192.168.1.1')")
     args = parser.parse_args()
@@ -1062,29 +1083,28 @@ def main() -> None:
         _print("and run this script as Administrator.")
         sys.exit(1)
 
-    host_ip = get_host_ip()
+    host_ip    = get_host_ip()
+    all_ifaces = list_interfaces()
 
-    # Interface selection
+    # Resolve default interface (prefer Wi-Fi by name, fall back to auto-detect)
+    wifi = [n for n, _, _ in all_ifaces
+            if "wi-fi" in n.lower() or "wifi" in n.lower() or "wireless" in n.lower()]
+    default_ifaces = wifi[:1] or [get_default_interface()]
+
+    # --interface skips the picker; omitting it shows the list for selection
     if args.interface:
         interfaces = args.interface
     else:
-        interfaces = select_interfaces(get_default_interface())
+        interfaces = choose_interfaces(all_ifaces, default_ifaces)
 
-    iface_display = ", ".join(interfaces)
+    iface_display   = ", ".join(interfaces)
     iface_for_sniff = interfaces if len(interfaces) > 1 else interfaces[0]
+
+    print_config(interfaces, all_ifaces, args.duration, args.mode, args.bpf_filter)
 
     ip_filter  = _extract_ip_from_filter(args.bpf_filter)
     flow_table = FlowTable(host_ip=host_ip, ip_filter=ip_filter)
-
     capture_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    _print(f"[bold cyan]Network Traffic Monitor[/bold cyan]")
-    _print(f"  Interface{'s' if len(interfaces) > 1 else ''} : [cyan]{iface_display}[/cyan]")
-    _print(f"  Host IP   : [cyan]{host_ip}[/cyan]")
-    _print(f"  Duration  : {'{}s'.format(args.duration) if args.duration else 'until Ctrl+C'}")
-    if args.bpf_filter:
-        _print(f"  BPF filter: {args.bpf_filter}")
-    _print("")
 
     dns = DNSCache()
     stop_event = threading.Event()
