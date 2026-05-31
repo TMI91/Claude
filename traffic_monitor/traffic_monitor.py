@@ -1059,7 +1059,13 @@ def print_config(interfaces: list, all_ifaces: list, duration: int,
 # Entry point
 # ---------------------------------------------------------------------------
 
+_HELP_FLAGS = {"?", "/?", "--?", "-?"}
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in _HELP_FLAGS:
+        print_usage()
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--interface", nargs="+", default=None, metavar="NIC",
                         help="NIC(s) to capture on (default: Wi-Fi or auto-detected)")
