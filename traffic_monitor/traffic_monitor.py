@@ -5,13 +5,20 @@ per-protocol statistics with basic anomaly detection.
 """
 
 import argparse
+import ipaddress
 import json
+import logging
 import socket
 import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Suppress scapy's "Unable to guess datalink type" and similar runtime warnings
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+logging.getLogger("scapy.interactive").setLevel(logging.ERROR)
+logging.getLogger("scapy.loading").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Rich — graceful fallback to plain text
@@ -332,6 +339,13 @@ def _extract_ip_from_filter(bpf_filter: str) -> str:
     m = re.match(r'^(?:host|src host|dst host|src|dst)\s+([\d.]+)$',
                  bpf_filter.strip(), re.IGNORECASE)
     return m.group(1) if m else ""
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
 
 
 def _classify_hostname(hostname: str) -> str:
@@ -793,20 +807,30 @@ def _print_analysis(flow_table: FlowTable, anomalies: list,
     # ── Provider classification ──────────────────────────────────────────────
     provider_bytes: dict = {}
     provider_ips:   dict = {}
-    unknown: list = []   # (ip, hostname, total_bytes, entry)
+    local_devices: list = []   # (ip, hostname, total_bytes)
+    unknown: list = []         # (ip, hostname, total_bytes, entry) — external, unrecognised
 
     for ip, entry in snap.items():
         hostname = dns.resolve(ip)
-        provider = _classify_hostname(hostname)
         total = entry["bytes_in"] + entry["bytes_out"]
+        if _is_private_ip(ip):
+            local_devices.append((ip, hostname, total))
+            continue
+        provider = _classify_hostname(hostname)
         if provider:
             provider_bytes[provider] = provider_bytes.get(provider, 0) + total
             provider_ips.setdefault(provider, set()).add(ip)
         else:
             unknown.append((ip, hostname, total, entry))
 
+    if local_devices:
+        _print("\n[bold]Local network devices:[/bold]")
+        for ip, hostname, total in sorted(local_devices, key=lambda x: -x[2]):
+            label = f" ({hostname})" if hostname else ""
+            _print(f"  [cyan]{ip}[/cyan]{label}  {_format_bytes(total)}")
+
     if provider_bytes:
-        _print("\n[bold]Identified services:[/bold]")
+        _print("\n[bold]Identified external services:[/bold]")
         for provider, total in sorted(provider_bytes.items(), key=lambda x: -x[1]):
             n = len(provider_ips[provider])
             _print(f"  [green]{provider:28}[/green] {_format_bytes(total):>9}  "
@@ -835,8 +859,12 @@ def _print_analysis(flow_table: FlowTable, anomalies: list,
     dns_ips = [ip for ip, entry in snap.items()
                if any(p == 53 for p, _ in entry["ports_contacted"])]
     if dns_ips:
-        names = [dns.resolve(ip) or ip for ip in dns_ips[:2]]
-        observations.append(f"DNS queries routed via: {', '.join(names)}.")
+        seen_names: list = []
+        for ip in dns_ips:
+            name = dns.resolve(ip) or ip
+            if name not in seen_names:
+                seen_names.append(name)
+        observations.append(f"DNS queries routed via: {', '.join(seen_names[:3])}.")
 
     http_ips = [(ip, dns.resolve(ip) or ip)
                 for ip, entry in snap.items()
@@ -871,8 +899,10 @@ def _print_analysis(flow_table: FlowTable, anomalies: list,
             f"--mode quiet --output {ip.replace('.', '_')}.json"
         )
 
-    # Anomaly recommendations
+    # Anomaly recommendations (skip private IPs — they're local devices)
     for a in anomalies:
+        if _is_private_ip(a["ip"]):
+            continue
         hostname = dns.resolve(a["ip"]) or ""
         label = f"{a['ip']} ({hostname})" if hostname else a["ip"]
         color = SEVERITY_COLORS.get(a["severity"], "")
