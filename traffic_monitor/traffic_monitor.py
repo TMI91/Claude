@@ -99,6 +99,62 @@ SEVERITY_COLORS = {
     "INFO":     "dim",
 }
 
+KNOWN_PROVIDERS = {
+    # Google
+    "google.com":           "Google",
+    "googleapis.com":       "Google",
+    "gstatic.com":          "Google",
+    "1e100.net":            "Google",
+    "googleusercontent.com":"Google",
+    "googlevideo.com":      "Google",
+    "ggpht.com":            "Google",
+    "youtube.com":          "YouTube",
+    "ytimg.com":            "YouTube",
+    # Microsoft
+    "microsoft.com":        "Microsoft",
+    "windows.com":          "Microsoft",
+    "windowsupdate.com":    "Microsoft",
+    "office.com":           "Microsoft",
+    "office365.com":        "Microsoft",
+    "microsoftonline.com":  "Microsoft",
+    "azure.com":            "Microsoft/Azure",
+    "azure.net":            "Microsoft/Azure",
+    "msftncsi.com":         "Microsoft",
+    "live.com":             "Microsoft",
+    "sharepoint.com":       "Microsoft",
+    "msecnd.net":           "Microsoft",
+    "skype.com":            "Microsoft",
+    # Amazon / AWS
+    "amazonaws.com":        "AWS",
+    "cloudfront.net":       "CloudFront/AWS",
+    "amazon.com":           "Amazon",
+    # Cloudflare
+    "cloudflare.com":       "Cloudflare",
+    "cloudflare-dns.com":   "Cloudflare",
+    "cfdata.org":           "Cloudflare",
+    # Akamai
+    "akamai.com":           "Akamai",
+    "akamaihd.net":         "Akamai",
+    "akamaicd.com":         "Akamai",
+    "edgesuite.net":        "Akamai",
+    "edgekey.net":          "Akamai",
+    # Apple
+    "apple.com":            "Apple",
+    "icloud.com":           "Apple/iCloud",
+    "cdn-apple.com":        "Apple",
+    "aaplimg.com":          "Apple",
+    # Meta
+    "facebook.com":         "Meta",
+    "fbcdn.net":            "Meta",
+    "instagram.com":        "Meta/Instagram",
+    "whatsapp.com":         "Meta/WhatsApp",
+    # CDNs / DNS
+    "fastly.com":           "Fastly CDN",
+    "cdn77.com":            "CDN77",
+    "dynect.net":           "Dyn DNS",
+    "dyn.com":              "Dyn DNS",
+}
+
 # Anomaly thresholds
 PORT_SCAN_THRESHOLD        = 15
 HIGH_VOLUME_BYTES          = 50 * 1024 * 1024   # 50 MB
@@ -276,6 +332,17 @@ def _extract_ip_from_filter(bpf_filter: str) -> str:
     m = re.match(r'^(?:host|src host|dst host|src|dst)\s+([\d.]+)$',
                  bpf_filter.strip(), re.IGNORECASE)
     return m.group(1) if m else ""
+
+
+def _classify_hostname(hostname: str) -> str:
+    """Return provider name for a hostname using KNOWN_PROVIDERS, or empty string."""
+    if not hostname:
+        return ""
+    h = hostname.lower().rstrip(".")
+    for suffix, provider in KNOWN_PROVIDERS.items():
+        if h == suffix or h.endswith("." + suffix):
+            return provider
+    return ""
 
 
 def _format_bytes(n: int) -> str:
@@ -712,6 +779,116 @@ def _print_summary(flow_table: FlowTable, anomalies: list,
 
 
 # ---------------------------------------------------------------------------
+# Traffic analysis / advice
+# ---------------------------------------------------------------------------
+
+def _print_analysis(flow_table: FlowTable, anomalies: list,
+                    dns: "DNSCache") -> None:
+    snap = flow_table.snapshot()
+    if not snap:
+        return
+
+    _print("\n[bold]--- Traffic Analysis ---[/bold]")
+
+    # ── Provider classification ──────────────────────────────────────────────
+    provider_bytes: dict = {}
+    provider_ips:   dict = {}
+    unknown: list = []   # (ip, hostname, total_bytes, entry)
+
+    for ip, entry in snap.items():
+        hostname = dns.resolve(ip)
+        provider = _classify_hostname(hostname)
+        total = entry["bytes_in"] + entry["bytes_out"]
+        if provider:
+            provider_bytes[provider] = provider_bytes.get(provider, 0) + total
+            provider_ips.setdefault(provider, set()).add(ip)
+        else:
+            unknown.append((ip, hostname, total, entry))
+
+    if provider_bytes:
+        _print("\n[bold]Identified services:[/bold]")
+        for provider, total in sorted(provider_bytes.items(), key=lambda x: -x[1]):
+            n = len(provider_ips[provider])
+            _print(f"  [green]{provider:28}[/green] {_format_bytes(total):>9}  "
+                   f"({n} IP{'s' if n != 1 else ''})")
+
+    # ── Observations ─────────────────────────────────────────────────────────
+    observations: list = []
+    all_ports = {(p, pr) for entry in snap.values()
+                 for p, pr in entry["ports_contacted"]}
+    all_protocols = {pr for entry in snap.values()
+                     for pr in entry["protocols"]}
+
+    if any(p == 443 and pr == "UDP" for p, pr in all_ports):
+        observations.append(
+            "UDP port 443 is [bold]QUIC / HTTP3[/bold] — used by Chrome and Edge "
+            "for faster HTTPS. Normal."
+        )
+
+    netbios_external = any(p == 137 for p, _ in all_ports)
+    if netbios_external:
+        observations.append(
+            "NetBIOS (UDP 137) to external IPs is normal on Windows with "
+            "[bold]Azure AD / domain authentication[/bold]."
+        )
+
+    dns_ips = [ip for ip, entry in snap.items()
+               if any(p == 53 for p, _ in entry["ports_contacted"])]
+    if dns_ips:
+        names = [dns.resolve(ip) or ip for ip in dns_ips[:2]]
+        observations.append(f"DNS queries routed via: {', '.join(names)}.")
+
+    http_ips = [(ip, dns.resolve(ip) or ip)
+                for ip, entry in snap.items()
+                if any(p == 80 and pr == "TCP" for p, pr in entry["ports_contacted"])]
+    for ip, label in http_ips[:3]:
+        observations.append(
+            f"[yellow]Unencrypted HTTP (port 80) to {label} ({ip})[/yellow] "
+            "— traffic is in plaintext."
+        )
+
+    if observations:
+        _print("\n[bold]Observations:[/bold]")
+        for obs in observations:
+            _print(f"  - {obs}")
+
+    # ── Recommendations ───────────────────────────────────────────────────────
+    recommendations: list = []
+
+    # Unknown IPs with notable traffic volume
+    for ip, hostname, total, entry in sorted(unknown, key=lambda x: -x[2]):
+        if total < 50 * 1024:   # skip if < 50 KB
+            continue
+        label = hostname if hostname else ip
+        flag = ""
+        if hostname and not _classify_hostname(hostname):
+            # Hostname resolved but provider unknown — potentially interesting
+            flag = f" [yellow](unusual hostname: {hostname})[/yellow]"
+        recommendations.append(
+            f"[cyan]{ip}[/cyan]{flag} transferred [bold]{_format_bytes(total)}[/bold] "
+            f"— unrecognised provider. Inspect with:\n"
+            f'    python traffic_monitor.py --filter "host {ip}" --duration 30 '
+            f"--mode quiet --output {ip.replace('.', '_')}.json"
+        )
+
+    # Anomaly recommendations
+    for a in anomalies:
+        hostname = dns.resolve(a["ip"]) or ""
+        label = f"{a['ip']} ({hostname})" if hostname else a["ip"]
+        color = SEVERITY_COLORS.get(a["severity"], "")
+        recommendations.append(
+            f"[{color}]{a['severity']}[/{color}] [{a['type'].replace('_', ' ')}] "
+            f"[cyan]{label}[/cyan] — {a['detail']}"
+        )
+
+    if recommendations:
+        _print("\n[bold]Recommendations:[/bold]")
+        for rec in recommendations:
+            _print(f"  - {rec}")
+        _print("")
+
+
+# ---------------------------------------------------------------------------
 # Help / usage
 # ---------------------------------------------------------------------------
 
@@ -823,6 +1000,7 @@ def main() -> None:
 
     anomalies = detect_anomalies(flow_table)
     _print_summary(flow_table, anomalies, dns)
+    _print_analysis(flow_table, anomalies, dns)
 
     if args.output:
         meta = {
